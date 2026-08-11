@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+printf '==> Verifying repository checkout\n'
+command -v git >/dev/null
+git rev-parse --is-inside-work-tree >/dev/null
+
+printf '==> No project dependencies to install yet\n'
+printf 'Orb setup complete.\n'
