@@ -1,0 +1,11 @@
+{
+  "maxChangedFiles": 100,
+  "maxAdditions": 5000,
+  "maxDeletions": 5000,
+  "requiredChecks": [
+    {
+      "name": "ci"
+    }
+  ],
+  "sensitivePaths": []
+}

@@ -8,5 +8,27 @@ printf '==> Verifying repository checkout\n'
 command -v git >/dev/null
 git rev-parse --is-inside-work-tree >/dev/null
 
-printf '==> No project dependencies to install yet\n'
+printf '==> Ensuring Node.js 22.12+\n'
+if ! command -v node >/dev/null || ! node -e "const [major, minor] = process.versions.node.split('.').map(Number); process.exit(major > 22 || (major === 22 && minor >= 12) ? 0 : 1)"; then
+  if ! command -v n >/dev/null; then
+    npm install --global n@10.2.0
+  fi
+  n 22.12.0
+  hash -r
+fi
+npm ci
+
+printf '==> Ensuring PostgreSQL\n'
+if ! command -v psql >/dev/null; then
+  sudo apt-get update -qq
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq postgresql
+fi
+sudo service postgresql start >/dev/null || true
+if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='merge_manager'" | grep -q 1; then
+  sudo -u postgres createuser merge_manager
+fi
+sudo -u postgres psql -v ON_ERROR_STOP=1 -c "ALTER ROLE merge_manager LOGIN PASSWORD 'merge_manager'" >/dev/null
+if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='merge_manager'" | grep -q 1; then
+  sudo -u postgres createdb -O merge_manager merge_manager
+fi
 printf 'Orb setup complete.\n'
