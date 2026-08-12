@@ -4,7 +4,8 @@
   "maxDeletions": 5000,
   "requiredChecks": [
     {
-      "name": "ci"
+      "name": "ci",
+      "appId": 15368
     }
   ],
   "sensitivePaths": []

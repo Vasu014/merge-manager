@@ -3,7 +3,9 @@ import { Octokit } from 'octokit';
 import { Pool } from 'pg';
 import { PgBoss, type Job } from 'pg-boss';
 import { loadConfig } from './config.js';
+import { handleCommand, refreshCandidate } from './candidate-controller.js';
 import { migrate } from './database.js';
+import { compareAndSwapRef } from './git-lander.js';
 import { reconcile } from './reconcile.js';
 import { buildServer } from './service.js';
 import { routeEvent } from './webhook.js';
@@ -11,7 +13,16 @@ import { routeEvent } from './webhook.js';
 const config = loadConfig();
 const pool = new Pool({ connectionString: config.DATABASE_URL });
 const boss = new PgBoss(config.DATABASE_URL);
-const github = new App({ appId: config.GITHUB_APP_ID, privateKey: config.GITHUB_PRIVATE_KEY, Octokit });
+const githubApp = new App({ appId: config.GITHUB_APP_ID, privateKey: config.GITHUB_PRIVATE_KEY, Octokit });
+const github = {
+  getInstallationOctokit: (installationId: number) => githubApp.getInstallationOctokit(installationId),
+  compareAndSwapRef: async (input: Omit<Parameters<typeof compareAndSwapRef>[0], 'token'> & { installationId: number }) => {
+    const authentication = await githubApp.octokit.auth({ type: 'installation', installationId: input.installationId }) as { token?: string };
+    if (typeof authentication.token !== 'string') throw new Error('installation_token_unavailable');
+    const { installationId: _installationId, ...request } = input;
+    return compareAndSwapRef({ ...request, token: authentication.token });
+  },
+};
 const deliveryQueue = 'process-delivery-v2';
 await migrate(pool);
 await boss.start();
@@ -31,8 +42,15 @@ await boss.work<{ deliveryId: string }>(deliveryQueue, async ([job]: Job<{ deliv
     if (!Number.isInteger(installationId)) {
       await pool.query("UPDATE webhook_deliveries SET processed_at=now(),disposition='ignored_missing_installation' WHERE delivery_id=$1", [job.data.deliveryId]); return;
     }
-    for (const pr of route.prs) await reconcile(github, pool, { ...route, pr, installationId, appId: config.GITHUB_APP_ID });
-    await pool.query("UPDATE webhook_deliveries SET processed_at=now(),disposition='reconciled',error=NULL WHERE delivery_id=$1", [job.data.deliveryId]);
+    if (route.kind === 'reconcile') {
+      for (const pr of route.prs) await reconcile(github, pool, { ...route, pr, installationId, appId: config.GITHUB_APP_ID });
+    } else if (route.kind === 'command') {
+      await reconcile(github, pool, { ...route, installationId, appId: config.GITHUB_APP_ID });
+      await handleCommand(github, pool, { ...route, installationId, appId: config.GITHUB_APP_ID });
+    } else {
+      await refreshCandidate(github, pool, installationId, route.repositoryId, route.candidateSha, config.GITHUB_APP_ID);
+    }
+    await pool.query('UPDATE webhook_deliveries SET processed_at=now(),disposition=$2,error=NULL WHERE delivery_id=$1', [job.data.deliveryId, route.kind]);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     await pool.query('UPDATE webhook_deliveries SET error=$2 WHERE delivery_id=$1', [job.data.deliveryId, message.slice(0, 4000)]);
@@ -62,6 +80,10 @@ async function sweep() {
     const rows = await pool.query("SELECT repository_id,pr_number,owner,repo,installation_id FROM pull_requests WHERE state='open' ORDER BY updated_at");
     for (const row of rows.rows) {
       await reconcile(github, pool, { repositoryId: Number(row.repository_id), pr: row.pr_number, owner: row.owner, repo: row.repo, installationId: Number(row.installation_id), appId: config.GITHUB_APP_ID }).catch(console.error);
+    }
+    const candidates = await pool.query("SELECT repository_id,installation_id,candidate_sha FROM candidates WHERE active AND candidate_sha IS NOT NULL ORDER BY updated_at");
+    for (const row of candidates.rows) {
+      await refreshCandidate(github, pool, Number(row.installation_id), Number(row.repository_id), row.candidate_sha, config.GITHUB_APP_ID).catch(console.error);
     }
   } finally { sweeping = false; }
 }

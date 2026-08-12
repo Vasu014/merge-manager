@@ -3,7 +3,9 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    branches:
+      - main
+      - merge-manager/candidates/**
 
 permissions:
   contents: read
@@ -11,6 +13,22 @@ permissions:
 jobs:
   ci:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17.6-alpine
+        env:
+          POSTGRES_DB: merge_manager_test
+          POSTGRES_USER: merge_manager
+          POSTGRES_PASSWORD: merge_manager_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U merge_manager -d merge_manager_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      INTEGRATION_DATABASE_URL: postgresql://merge_manager:merge_manager_test@127.0.0.1:5432/merge_manager_test
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -24,7 +42,7 @@ jobs:
       - run: docker build --tag merge-manager:test .
 
   publish:
-    if: github.event_name == 'push'
+    if: github.ref == 'refs/heads/main'
     needs: ci
     runs-on: ubuntu-latest
     permissions:

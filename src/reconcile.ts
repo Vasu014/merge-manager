@@ -4,7 +4,7 @@ import type { Pool, PoolClient } from 'pg';
 import { checkOutput } from './check-output.js';
 import { transactionOnClient } from './database.js';
 import { evaluate, type Decision, type Facts } from './evaluator.js';
-import { defaultPolicy, policySchema } from './policy.js';
+import { loadTrustedPolicy } from './trusted-policy.js';
 
 const CHECK_PREFIX = 'merge-manager/shadow/pr-';
 const VERSION = 'observer-v1';
@@ -30,36 +30,27 @@ async function reconcileLocked(app: GitHubApp, client: PoolClient, target: Targe
   const common = { owner: target.owner, repo: target.repo };
   const checkName = `${CHECK_PREFIX}${target.pr}`;
   const { data: pr } = await octokit.rest.pulls.get({ ...common, pull_number: target.pr });
+  const targetBranch = pr.base.ref;
+  const assignedBaseSha = (await octokit.rest.git.getRef({ ...common, ref: `heads/${targetBranch}` })).data.object.sha;
   if (pr.state !== 'open') {
     await transactionOnClient(client, async () => {
       await client.query(`INSERT INTO pull_requests(repository_id,pr_number,owner,repo,installation_id,head_sha,base_sha,state) VALUES($1,$2,$3,$4,$5,$6,$7,$8)
-        ON CONFLICT(repository_id,pr_number) DO UPDATE SET owner=$3,repo=$4,installation_id=$5,head_sha=$6,base_sha=$7,state=$8,updated_at=now()`, [target.repositoryId, target.pr, target.owner, target.repo, target.installationId, pr.head.sha, pr.base.sha, pr.state]);
+        ON CONFLICT(repository_id,pr_number) DO UPDATE SET owner=$3,repo=$4,installation_id=$5,head_sha=$6,base_sha=$7,state=$8,updated_at=now()`, [target.repositoryId, target.pr, target.owner, target.repo, target.installationId, pr.head.sha, assignedBaseSha, pr.state]);
       await client.query('UPDATE attempts SET active=false,superseded_at=now() WHERE repository_id=$1 AND pr_number=$2 AND active', [target.repositoryId, target.pr]);
     });
     return;
   }
-  const [files, reviews, checks] = await Promise.all([
+  const [files, reviews, suites] = await Promise.all([
     octokit.paginate(octokit.rest.pulls.listFiles, { ...common, pull_number: target.pr, per_page: 100 }),
     octokit.paginate(octokit.rest.pulls.listReviews, { ...common, pull_number: target.pr, per_page: 100 }),
-    octokit.paginate(octokit.rest.checks.listForRef, { ...common, ref: pr.head.sha, per_page: 100 }),
+    octokit.paginate(octokit.rest.checks.listSuitesForRef, { ...common, ref: pr.head.sha, per_page: 100 }),
   ]);
-  let policy = defaultPolicy;
-  let policyEvidence: unknown = policy;
-  let policyDecision: Decision | undefined;
-  try {
-    const response = await octokit.rest.repos.getContent({ ...common, path: '.merge-manager/policy.json', ref: pr.base.sha });
-    if (Array.isArray(response.data) || response.data.type !== 'file' || response.data.encoding !== 'base64' || typeof response.data.content !== 'string') throw new Error('Policy must be a Base64-encoded file.');
-    const rawPolicy = Buffer.from(response.data.content, 'base64').toString('utf8');
-    policyEvidence = rawPolicy;
-    policy = policySchema.parse(JSON.parse(rawPolicy));
-  } catch (error: any) {
-    if (error?.status === 404) policyEvidence = policy;
-    else if (error?.status) throw error;
-    else {
-      policyEvidence = { invalid: true, baseSha: pr.base.sha };
-      policyDecision = { outcome: 'human_review', code: 'invalid_policy', message: 'The trusted merge policy is invalid and requires human review.' };
-    }
-  }
+  const prSuites = suites.filter((suite) => suite.head_branch === pr.head.ref && suite.head_sha === pr.head.sha);
+  const checks = (await Promise.all(prSuites.map((suite) => octokit.paginate(octokit.rest.checks.listForSuite, { ...common, check_suite_id: suite.id, per_page: 100 })))).flat();
+  const trustedPolicy = await loadTrustedPolicy(octokit, common, assignedBaseSha);
+  const policy = trustedPolicy.policy;
+  const policyEvidence = trustedPolicy.evidence;
+  const policyDecision: Decision | undefined = trustedPolicy.valid ? undefined : { outcome: 'human_review', code: 'invalid_policy', message: 'The trusted merge policy is invalid and requires human review.' };
   const checkFacts: Facts['checks'] = checks.filter((c) => !(c.app?.id === target.appId && c.name.startsWith(CHECK_PREFIX))).map((c) => ({ name: c.name, ...(c.app?.id ? { appId: c.app.id } : {}), status: c.status, conclusion: c.conclusion }));
   const latestReviews = new Map<number, string>();
   for (const review of reviews) {
@@ -73,31 +64,34 @@ async function reconcileLocked(app: GitHubApp, client: PoolClient, target: Targe
   const decision = policyDecision ?? evaluate(facts, policy);
   const attempt = await transactionOnClient(client, async () => {
     await client.query(`INSERT INTO pull_requests(repository_id,pr_number,owner,repo,installation_id,head_sha,base_sha,state) VALUES($1,$2,$3,$4,$5,$6,$7,'open')
-      ON CONFLICT(repository_id,pr_number) DO UPDATE SET owner=$3,repo=$4,installation_id=$5,head_sha=$6,base_sha=$7,state='open',updated_at=now()`, [target.repositoryId, target.pr, target.owner, target.repo, target.installationId, pr.head.sha, pr.base.sha]);
+      ON CONFLICT(repository_id,pr_number) DO UPDATE SET owner=$3,repo=$4,installation_id=$5,head_sha=$6,base_sha=$7,state='open',updated_at=now()`, [target.repositoryId, target.pr, target.owner, target.repo, target.installationId, pr.head.sha, assignedBaseSha]);
     const pd = digest(policyEvidence), fd = digest(facts), dd = digest(decision);
     const current = await client.query('SELECT * FROM attempts WHERE repository_id=$1 AND pr_number=$2 AND active FOR UPDATE', [target.repositoryId, target.pr]);
     const row = current.rows[0];
-    if (row && row.head_sha === pr.head.sha && row.base_sha === pr.base.sha && row.policy_digest === pd && row.evaluator_version === VERSION) {
+    if (row && row.head_sha === pr.head.sha && row.base_sha === assignedBaseSha && row.policy_digest === pd && row.evaluator_version === VERSION) {
       await client.query('UPDATE attempts SET facts=$2,decision=$3,facts_digest=$4,decision_digest=$5 WHERE id=$1', [row.id, facts, decision, fd, dd]);
       return { ...row, decision, decision_digest: dd };
     }
     await client.query('UPDATE attempts SET active=false,superseded_at=now() WHERE repository_id=$1 AND pr_number=$2 AND active', [target.repositoryId, target.pr]);
     const id = randomUUID();
-    await client.query('INSERT INTO attempts(id,repository_id,pr_number,head_sha,base_sha,policy_digest,evaluator_version,facts,decision,facts_digest,decision_digest) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)', [id,target.repositoryId,target.pr,pr.head.sha,pr.base.sha,pd,VERSION,facts,decision,fd,dd]);
+    await client.query('INSERT INTO attempts(id,repository_id,pr_number,head_sha,base_sha,policy_digest,evaluator_version,facts,decision,facts_digest,decision_digest) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)', [id,target.repositoryId,target.pr,pr.head.sha,assignedBaseSha,pd,VERSION,facts,decision,fd,dd]);
     return { id, check_run_id: null, output_digest: null, decision, decision_digest: dd };
   });
   const output = checkOutput(decision), outputDigest = digest(output);
   if (attempt.output_digest === outputDigest && !target.force) return;
   const stillActive = await client.query('SELECT active FROM attempts WHERE id=$1 AND head_sha=$2', [attempt.id, pr.head.sha]);
   if (!stillActive.rows[0]?.active) return;
-  const latest = await octokit.rest.pulls.get({ ...common, pull_number: target.pr });
-  if (latest.data.state !== 'open' || latest.data.head.sha !== pr.head.sha || latest.data.base.sha !== pr.base.sha) return;
+  const [latest, latestBase] = await Promise.all([
+    octokit.rest.pulls.get({ ...common, pull_number: target.pr }),
+    octokit.rest.git.getRef({ ...common, ref: `heads/${targetBranch}` }),
+  ]);
+  if (latest.data.state !== 'open' || latest.data.head.sha !== pr.head.sha || latest.data.base.ref !== targetBranch || latestBase.data.object.sha !== assignedBaseSha) return;
   let checkId = attempt.check_run_id as number | null;
   if (!checkId) {
     const existing = checks.find((c) => c.name === checkName && c.app?.id === target.appId && c.external_id === attempt.id);
     checkId = existing?.id ?? null;
   }
-  const checkData = { name: checkName, external_id: attempt.id, ...output, output: { ...output.output, text: `Pull request: #${target.pr}\n\nBase: \`${pr.base.sha}\`` } };
+  const checkData = { name: checkName, external_id: attempt.id, ...output, output: { ...output.output, text: `Pull request: #${target.pr}\n\nTarget: \`${targetBranch}\`\n\nAssigned base: \`${assignedBaseSha}\`` } };
   if (checkId) await octokit.rest.checks.update({ ...common, check_run_id: checkId, ...checkData });
   else {
     try { checkId = (await octokit.rest.checks.create({ ...common, head_sha: pr.head.sha, ...checkData })).data.id; }

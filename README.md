@@ -1,6 +1,6 @@
 # merge-manager
 
-An observer-only first slice of an agentic merge controller. GitHub webhooks are durable reconciliation signals; fresh GitHub state and deterministic policy produce a PR-specific `merge-manager/shadow/pr-<number>` Check. **It cannot merge, write repository contents, run agents, or post PR comments.**
+An observed-mode deterministic merge controller. GitHub webhooks are durable reconciliation signals; fresh GitHub state and trusted-base policy produce a PR-specific `merge-manager/shadow/pr-<number>` Check. Authorized collaborators can ask it to prepare, validate, land, retry, or cancel an exact integration candidate through PR comments. It does not run an agent or automatically authorize landing.
 
 ## Architecture
 
@@ -10,7 +10,18 @@ Relevant events are `pull_request` (state-changing actions), `pull_request_revie
 
 ## GitHub App
 
-Repository permissions: **Metadata: read**, **Pull requests: read**, **Checks: read/write**, and **Contents: read**. Subscribe to Pull request, Pull request review, and Check run events. Observer v1 supports Checks API check runs, not legacy commit statuses. Contents write, administration, issues, and merge permissions are explicitly unnecessary. Configure the webhook URL as `/github/webhooks` and use the same webhook secret as `GITHUB_WEBHOOK_SECRET`.
+Repository permissions: **Metadata: read**, **Pull requests: read**, **Checks: read/write**, **Contents: read/write**, and **Issues: read**. Subscribe to Pull request, Pull request review, Check run, and Issue comment events. Contents write is used only for namespaced candidate refs and an atomic force-with-lease target update after exact-SHA revalidation. Configure the webhook URL as `/github/webhooks` and use the same webhook secret as `GITHUB_WEBHOOK_SECRET`.
+
+Observed-mode commands must be the complete PR comment and require the actor to currently have GitHub `write`, `maintain`, or `admin` permission:
+
+```text
+@merge-manager ready
+@merge-manager retry
+@merge-manager land
+@merge-manager cancel
+```
+
+`ready`/`retry` freeze the PR head and current target SHA, construct a merge commit under `merge-manager/candidates/pr-<number>/<attempt>`, and evaluate required Checks on that exact candidate. `land` rechecks the PR head, target SHA, policy-bound candidate checks, and ancestry before using Git's atomic force-with-lease protocol to update the target only if it still equals the frozen SHA. Any movement marks the candidate stale instead of landing it.
 
 ## Local setup
 
