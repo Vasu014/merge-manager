@@ -1,0 +1,12 @@
+[Unit]
+Description=Check for a new Merge Manager release
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+RandomizedDelaySec=15s
+Persistent=true
+Unit=merge-manager-update.service
+
+[Install]
+WantedBy=timers.target

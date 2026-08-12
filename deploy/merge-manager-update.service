@@ -1,0 +1,11 @@
+[Unit]
+Description=Deploy the latest published Merge Manager main commit
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/merge-manager/update.sh
+
+[Install]
+WantedBy=default.target

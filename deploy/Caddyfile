@@ -1,0 +1,4 @@
+merge.work-ops.app {
+    encode zstd gzip
+    reverse_proxy merge-manager:3000
+}

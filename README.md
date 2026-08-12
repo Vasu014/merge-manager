@@ -24,6 +24,20 @@ npm run dev
 
 The orb `.agents/setup` script idempotently provisions Node, dependencies, PostgreSQL, and a local `merge_manager` role/database; `.agents/resume` only restarts/checks PostgreSQL. The example database password is only for this local disposable environment and must not be used in a deployment. Environment files and secrets are not committed.
 
+## Single-server deployment
+
+Production runs on `merge.work-ops.app` with host-managed Caddy in front of a rootless Docker Compose stack containing this application and PostgreSQL. Every passing push to `main` publishes an immutable `ghcr.io/vasu014/merge-manager:<git-sha>` image. A rootless systemd timer on Hetzner reads the public repository's exact `main` SHA every two minutes and deploys the corresponding image after it becomes available. The server needs no GitHub or SSH deployment credential. Runtime secrets remain in `/opt/merge-manager/.env`.
+
+Initial host setup:
+
+1. Install Docker with its rootless extras, then run `deploy/bootstrap.sh` as root on Ubuntu. It creates a dedicated `deploy` user and rootless daemon without changing the system Docker daemon.
+2. Copy `deploy/.env.example` to `/opt/merge-manager/.env`, replace every placeholder, and set mode `0600` owned by `deploy`.
+3. Install `deploy/update.sh` in `/opt/merge-manager` and its service/timer files in the deploy user's systemd configuration.
+4. Make the `ghcr.io/vasu014/merge-manager` container package public so the credential-free updater can pull it.
+5. Install host-managed Caddy with `deploy/Caddyfile`, configure Cloudflare DNS for `merge.work-ops.app`, and use Full (strict) TLS. Do not challenge or cache `/github/webhooks`.
+
+`deploy/deploy.sh` updates only the application container, waits for `/health`, and restores the previous immutable image if the new container fails. PostgreSQL data lives in a rootless Docker volume; Caddy reaches the application only on `127.0.0.1:3000`. Back up PostgreSQL off-host before treating this beta as durable.
+
 ## Policy
 
 `.merge-manager/policy.json` is read from each PR's **base SHA** and validated with Zod. This repository requires its GitHub Actions `ci` check. Missing policy files in other repositories use conservative size limits but no repository-specific required checks. Invalid policy fails reconciliation rather than becoming eligible. Required checks accept `{ "name": "ci", "appId": 123 }`, where `appId` is optional. Missing, pending, or ambiguous required checks wait; failures require author action.
