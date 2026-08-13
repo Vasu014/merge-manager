@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { Pool } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { handleCommand } from './candidate-controller.js';
+import { handleCommand, refreshCandidate } from './candidate-controller.js';
 import { migrate } from './database.js';
 
 const connectionString = process.env.INTEGRATION_DATABASE_URL;
@@ -12,32 +12,45 @@ const candidateSha = '3'.repeat(40);
 
 function github(repositoryId: number, pr: number, permission = 'write', mutateCandidateRef = false) {
   let currentBase = baseSha;
+  let currentHead = headSha;
+  let prState = 'open';
   let targetBranch = 'main';
   let candidateRefMoved = mutateCandidateRef;
   let moveBaseDuringLand = false;
+  let rejectLandingWithoutMovement = false;
   let loseLandingResponse = false;
   let losePostLandingRead = false;
   let failNextTargetRead = false;
   let candidateRef = '';
   let candidateRefSha = '';
+  let mergeConflict = false;
+  let wrongParents = false;
+  let permissionUserId = 7;
+  let compareAndSwapCalls = 0;
+  let checkRuns: any[] = [{ name: 'ci', app: { id: 15368 }, status: 'completed', conclusion: 'success' }];
+  let checkSuites: any[] | undefined;
+  let checkSuiteHeadSha = candidateSha;
   const updates: { ref: string; sha: string; force: boolean }[] = [];
   const deleted: string[] = [];
   const checks: any[] = [];
   const policy = Buffer.from(JSON.stringify({ requiredChecks: [{ name: 'ci', appId: 15368 }] })).toString('base64');
   const rest = {
     repos: {
-      getCollaboratorPermissionLevel: async () => ({ data: { permission, user: { id: 7 } } }),
+      getCollaboratorPermissionLevel: async () => ({ data: { permission, user: { id: permissionUserId } } }),
       getContent: async () => ({ data: { type: 'file', encoding: 'base64', content: policy } }),
-      merge: async ({ base }: { base: string }) => { candidateRefSha = candidateSha; candidateRef = base; return { data: { sha: candidateSha } }; },
+      merge: async ({ base }: { base: string }) => {
+        if (mergeConflict) throw Object.assign(new Error('conflict'), { status: 409 });
+        candidateRefSha = candidateSha; candidateRef = base; return { data: { sha: candidateSha } };
+      },
       compareCommitsWithBasehead: async ({ basehead }: { basehead: string }) => ({ data: { status: 'ahead', merge_base_commit: { sha: basehead.startsWith(baseSha) ? baseSha : headSha } } }),
     },
-    pulls: { get: async () => ({ data: { state: 'open', draft: false, head: { sha: headSha, repo: { fork: false } }, base: { ref: targetBranch } } }) },
+    pulls: { get: async () => ({ data: { state: prState, draft: false, head: { sha: currentHead, repo: { fork: false } }, base: { ref: targetBranch } } }) },
     git: {
       getRef: async ({ ref }: { ref: string }) => {
         if (ref === 'heads/main' && failNextTargetRead) { failNextTargetRead = false; throw new Error('simulated_transport_failure'); }
         return { data: { object: { sha: ref === 'heads/main' ? currentBase : candidateRefMoved && candidateRefSha === candidateSha ? '5'.repeat(40) : candidateRefSha } } };
       },
-      getCommit: async () => ({ data: { parents: [{ sha: baseSha }, { sha: headSha }] } }),
+      getCommit: async () => ({ data: { parents: wrongParents ? [{ sha: headSha }, { sha: baseSha }] : [{ sha: baseSha }, { sha: headSha }] } }),
       createRef: async ({ ref, sha }: { ref: string; sha: string }) => { candidateRef = ref.replace('refs/heads/', ''); candidateRefSha = sha; return { data: {} }; },
       deleteRef: async ({ ref }: { ref: string }) => { deleted.push(ref); return { data: {} }; },
     },
@@ -51,13 +64,15 @@ function github(repositoryId: number, pr: number, permission = 'write', mutateCa
   const octokit = {
     rest,
     paginate: async (method: unknown) => method === rest.checks.listSuitesForRef
-      ? [{ id: 88, head_branch: candidateRef, head_sha: candidateSha }]
-      : [{ name: 'ci', app: { id: 15368 }, status: 'completed', conclusion: 'success' }],
+      ? checkSuites ?? [{ id: 88, head_branch: candidateRef, head_sha: checkSuiteHeadSha }]
+      : checkRuns,
   };
   const app = {
     getInstallationOctokit: async () => octokit,
     compareAndSwapRef: async (input: { ref: string; candidateSha: string; expectedSha: string }) => {
+      compareAndSwapCalls += 1;
       if (moveBaseDuringLand) currentBase = '4'.repeat(40);
+      if (rejectLandingWithoutMovement) return 'unknown' as const;
       if (currentBase !== input.expectedSha) return 'unknown' as const;
       updates.push({ ref: `heads/${input.ref}`, sha: input.candidateSha, force: false });
       currentBase = input.candidateSha;
@@ -69,10 +84,20 @@ function github(repositoryId: number, pr: number, permission = 'write', mutateCa
     app, updates, deleted, checks,
     moveBase: () => { currentBase = '4'.repeat(40); },
     moveBaseDuringLand: () => { moveBaseDuringLand = true; },
+    rejectLandingWithoutMovement: () => { rejectLandingWithoutMovement = true; },
     loseLandingResponse: () => { loseLandingResponse = true; },
     losePostLandingRead: () => { losePostLandingRead = true; },
     moveCandidateRef: () => { candidateRefMoved = true; },
+    moveHead: () => { currentHead = '6'.repeat(40); },
+    closePr: () => { prState = 'closed'; },
     retarget: () => { targetBranch = 'release'; }, repositoryId, pr,
+    setChecks: (value: any[]) => { checkRuns = value; },
+    setCheckSuites: (value: any[]) => { checkSuites = value; },
+    setCheckSuiteHeadSha: (value: string) => { checkSuiteHeadSha = value; },
+    setMergeConflict: () => { mergeConflict = true; },
+    setWrongParents: () => { wrongParents = true; },
+    setPermissionUserId: (id: number) => { permissionUserId = id; },
+    compareAndSwapCalls: () => compareAndSwapCalls,
   };
 }
 
@@ -192,5 +217,149 @@ integration('observed-mode candidate lifecycle', () => {
     await handleCommand(fake.app, pool, landCommand);
     expect(fake.updates).toHaveLength(1);
     expect((await pool.query('SELECT active,status,reason FROM candidates WHERE repository_id=$1', [repositoryId])).rows[0]).toEqual({ active: false, status: 'LANDED', reason: 'landed_exact_candidate' });
+  });
+
+  it('stales a ready candidate when the pull request head changes', async () => {
+    const repositoryId = Date.now() + 90; const pr = 110;
+    await seed(repositoryId, pr);
+    const fake = github(repositoryId, pr);
+    const target = { installationId: 1, repositoryId, owner: 'o', repo: 'r', pr, actorId: 7, actorLogin: 'alice', appId: 9 };
+    await handleCommand(fake.app, pool, { ...target, commentId: repositoryId, command: 'ready' });
+    fake.moveHead();
+    await expect(handleCommand(fake.app, pool, { ...target, commentId: repositoryId + 1, command: 'land' })).rejects.toThrow('candidate_became_stale');
+    expect(fake.updates).toEqual([]);
+    expect((await pool.query('SELECT active,status,reason FROM candidates WHERE repository_id=$1', [repositoryId])).rows[0]).toEqual({ active: false, status: 'STALE', reason: 'pr_head_target_or_base_moved' });
+  });
+
+  it('stales a ready candidate when the pull request closes', async () => {
+    const repositoryId = Date.now() + 100; const pr = 111;
+    await seed(repositoryId, pr);
+    const fake = github(repositoryId, pr);
+    const target = { installationId: 1, repositoryId, owner: 'o', repo: 'r', pr, actorId: 7, actorLogin: 'alice', appId: 9 };
+    await handleCommand(fake.app, pool, { ...target, commentId: repositoryId, command: 'ready' });
+    fake.closePr();
+    await expect(handleCommand(fake.app, pool, { ...target, commentId: repositoryId + 1, command: 'land' })).rejects.toThrow('candidate_became_stale');
+    expect(fake.updates).toEqual([]);
+  });
+
+  it('revokes READY when its trusted check later fails', async () => {
+    const repositoryId = Date.now() + 110; const pr = 112;
+    await seed(repositoryId, pr);
+    const fake = github(repositoryId, pr);
+    const target = { installationId: 1, repositoryId, owner: 'o', repo: 'r', pr, actorId: 7, actorLogin: 'alice', appId: 9 };
+    await handleCommand(fake.app, pool, { ...target, commentId: repositoryId, command: 'ready' });
+    fake.setChecks([{ name: 'ci', app: { id: 15368 }, status: 'completed', conclusion: 'failure' }]);
+    await refreshCandidate(fake.app, pool, 1, repositoryId, candidateSha, 9);
+    expect((await pool.query('SELECT status,reason FROM candidates WHERE repository_id=$1 AND active', [repositoryId])).rows[0]).toEqual({ status: 'AUTHOR_ACTION', reason: 'failed_check:ci' });
+    await expect(handleCommand(fake.app, pool, { ...target, commentId: repositoryId + 1, command: 'land' })).rejects.toThrow('candidate_not_ready');
+    expect(fake.updates).toEqual([]);
+  });
+
+  it('does not accept an identically named check from an untrusted app', async () => {
+    const repositoryId = Date.now() + 120; const pr = 113;
+    await seed(repositoryId, pr);
+    const fake = github(repositoryId, pr);
+    fake.setChecks([{ name: 'ci', app: { id: 999 }, status: 'completed', conclusion: 'success' }]);
+    await handleCommand(fake.app, pool, { installationId: 1, repositoryId, owner: 'o', repo: 'r', pr, actorId: 7, actorLogin: 'alice', appId: 9, commentId: repositoryId, command: 'ready' });
+    expect((await pool.query('SELECT status,reason FROM candidates WHERE repository_id=$1', [repositoryId])).rows[0]).toEqual({ status: 'VALIDATING', reason: 'missing_check:ci' });
+    expect(fake.updates).toEqual([]);
+  });
+
+  it('does not accept duplicate successful checks from the trusted app', async () => {
+    const repositoryId = Date.now() + 130; const pr = 114;
+    await seed(repositoryId, pr);
+    const fake = github(repositoryId, pr);
+    fake.setChecks([
+      { name: 'ci', app: { id: 15368 }, status: 'completed', conclusion: 'success' },
+      { name: 'ci', app: { id: 15368 }, status: 'completed', conclusion: 'success' },
+    ]);
+    await handleCommand(fake.app, pool, { installationId: 1, repositoryId, owner: 'o', repo: 'r', pr, actorId: 7, actorLogin: 'alice', appId: 9, commentId: repositoryId, command: 'ready' });
+    expect((await pool.query('SELECT status,reason FROM candidates WHERE repository_id=$1', [repositoryId])).rows[0]).toEqual({ status: 'VALIDATING', reason: 'ambiguous_check:ci' });
+  });
+
+  it('ignores a passing suite from the wrong branch even at the candidate SHA', async () => {
+    const repositoryId = Date.now() + 135; const pr = 121;
+    await seed(repositoryId, pr);
+    const fake = github(repositoryId, pr);
+    fake.setCheckSuites([{ id: 88, head_branch: 'attacker-controlled-ref', head_sha: candidateSha }]);
+    await handleCommand(fake.app, pool, { installationId: 1, repositoryId, owner: 'o', repo: 'r', pr, actorId: 7, actorLogin: 'alice', appId: 9, commentId: repositoryId, command: 'ready' });
+    expect((await pool.query('SELECT status,reason FROM candidates WHERE repository_id=$1', [repositoryId])).rows[0]).toEqual({ status: 'VALIDATING', reason: 'missing_check:ci' });
+  });
+
+  it('ignores a passing suite from the candidate branch at the wrong SHA', async () => {
+    const repositoryId = Date.now() + 137; const pr = 122;
+    await seed(repositoryId, pr);
+    const fake = github(repositoryId, pr);
+    fake.setCheckSuiteHeadSha('7'.repeat(40));
+    await handleCommand(fake.app, pool, { installationId: 1, repositoryId, owner: 'o', repo: 'r', pr, actorId: 7, actorLogin: 'alice', appId: 9, commentId: repositoryId, command: 'ready' });
+    expect((await pool.query('SELECT status,reason FROM candidates WHERE repository_id=$1', [repositoryId])).rows[0]).toEqual({ status: 'VALIDATING', reason: 'missing_check:ci' });
+  });
+
+  it('keeps a merge conflict away from the target branch', async () => {
+    const repositoryId = Date.now() + 140; const pr = 115;
+    await seed(repositoryId, pr);
+    const fake = github(repositoryId, pr);
+    fake.setMergeConflict();
+    await handleCommand(fake.app, pool, { installationId: 1, repositoryId, owner: 'o', repo: 'r', pr, actorId: 7, actorLogin: 'alice', appId: 9, commentId: repositoryId, command: 'ready' });
+    expect((await pool.query('SELECT status,reason,candidate_sha FROM candidates WHERE repository_id=$1', [repositoryId])).rows[0]).toEqual({ status: 'AUTHOR_ACTION', reason: 'merge_conflict', candidate_sha: null });
+    expect(fake.updates).toEqual([]);
+  });
+
+  it('rejects a merge commit whose parents are not exact and ordered', async () => {
+    const repositoryId = Date.now() + 150; const pr = 116;
+    await seed(repositoryId, pr);
+    const fake = github(repositoryId, pr);
+    fake.setWrongParents();
+    await expect(handleCommand(fake.app, pool, { installationId: 1, repositoryId, owner: 'o', repo: 'r', pr, actorId: 7, actorLogin: 'alice', appId: 9, commentId: repositoryId, command: 'ready' })).rejects.toThrow('candidate_parents_do_not_match_exact_base_and_head');
+    expect(fake.updates).toEqual([]);
+    expect((await pool.query('SELECT active,status FROM candidates WHERE repository_id=$1', [repositoryId])).rows[0]).toEqual({ active: false, status: 'FAILED' });
+  });
+
+  it('rejects a command when webhook actor ID and GitHub collaborator identity differ', async () => {
+    const repositoryId = Date.now() + 160; const pr = 117;
+    await seed(repositoryId, pr);
+    const fake = github(repositoryId, pr);
+    fake.setPermissionUserId(8);
+    await expect(handleCommand(fake.app, pool, { installationId: 1, repositoryId, owner: 'o', repo: 'r', pr, actorId: 7, actorLogin: 'alice', appId: 9, commentId: repositoryId, command: 'ready' })).rejects.toThrow('command_actor_identity_mismatch');
+    expect((await pool.query('SELECT count(*)::int AS count FROM candidates WHERE repository_id=$1', [repositoryId])).rows[0].count).toBe(0);
+  });
+
+  it('serializes duplicate concurrent land deliveries and pushes once', async () => {
+    const repositoryId = Date.now() + 170; const pr = 118;
+    await seed(repositoryId, pr);
+    const fake = github(repositoryId, pr);
+    const target = { installationId: 1, repositoryId, owner: 'o', repo: 'r', pr, actorId: 7, actorLogin: 'alice', appId: 9 };
+    await handleCommand(fake.app, pool, { ...target, commentId: repositoryId, command: 'ready' });
+    const command = { ...target, commentId: repositoryId + 1, command: 'land' as const };
+    await Promise.all([handleCommand(fake.app, pool, command), handleCommand(fake.app, pool, command)]);
+    expect(fake.compareAndSwapCalls()).toBe(1);
+    expect(fake.updates).toHaveLength(1);
+  });
+
+  it('keeps a failed atomic update retryable when the target did not move', async () => {
+    const repositoryId = Date.now() + 180; const pr = 119;
+    await seed(repositoryId, pr);
+    const fake = github(repositoryId, pr);
+    const target = { installationId: 1, repositoryId, owner: 'o', repo: 'r', pr, actorId: 7, actorLogin: 'alice', appId: 9 };
+    await handleCommand(fake.app, pool, { ...target, commentId: repositoryId, command: 'ready' });
+    fake.rejectLandingWithoutMovement();
+    await expect(handleCommand(fake.app, pool, { ...target, commentId: repositoryId + 1, command: 'land' })).rejects.toThrow('landing_failed_without_ref_change');
+    expect(fake.updates).toEqual([]);
+    expect((await pool.query('SELECT active,status,reason FROM candidates WHERE repository_id=$1', [repositoryId])).rows[0]).toEqual({ active: true, status: 'LANDING', reason: 'atomic_update_in_progress' });
+  });
+
+  it('serializes simultaneous retries and leaves one active candidate', async () => {
+    const repositoryId = Date.now() + 190; const pr = 120;
+    await seed(repositoryId, pr);
+    const fake = github(repositoryId, pr);
+    const target = { installationId: 1, repositoryId, owner: 'o', repo: 'r', pr, actorId: 7, actorLogin: 'alice', appId: 9 };
+    await Promise.all([
+      handleCommand(fake.app, pool, { ...target, commentId: repositoryId, command: 'retry' }),
+      handleCommand(fake.app, pool, { ...target, commentId: repositoryId + 1, command: 'retry' }),
+    ]);
+    const rows = (await pool.query('SELECT active,status FROM candidates WHERE repository_id=$1 ORDER BY created_at', [repositoryId])).rows;
+    expect(rows).toHaveLength(2);
+    expect(rows.filter((row) => row.active)).toEqual([{ active: true, status: 'READY' }]);
+    expect(rows.filter((row) => !row.active)).toEqual([{ active: false, status: 'SUPERSEDED' }]);
   });
 });

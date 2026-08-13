@@ -45,4 +45,11 @@ describe('atomic git landing', () => {
     expect(await compareAndSwapRef({ owner: 'o', repo: 'r', ref: 'main', candidateRef: 'merge-manager/candidates/test', candidateSha: fixture.candidate, expectedSha: fixture.base, token: '', remoteUrl: fixture.remote })).toBe('unknown');
     expect((await exec('git', ['--git-dir', fixture.remote, 'rev-parse', 'refs/heads/main'])).stdout.trim()).toBe(fixture.head);
   });
+
+  it('rejects a candidate ref replaced after validation', async () => {
+    const fixture = await repository();
+    await exec('git', ['--git-dir', fixture.remote, 'update-ref', 'refs/heads/merge-manager/candidates/test', fixture.head]);
+    await expect(compareAndSwapRef({ owner: 'o', repo: 'r', ref: 'main', candidateRef: 'merge-manager/candidates/test', candidateSha: fixture.candidate, expectedSha: fixture.base, token: '', remoteUrl: fixture.remote })).rejects.toThrow('fetched_candidate_does_not_match');
+    expect((await exec('git', ['--git-dir', fixture.remote, 'rev-parse', 'refs/heads/main'])).stdout.trim()).toBe(fixture.base);
+  });
 });
